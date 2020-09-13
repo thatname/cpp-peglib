@@ -1477,7 +1477,7 @@ typedef std::unordered_map<std::string, Definition> Grammar;
 
 class Reference : public Ope, public std::enable_shared_from_this<Reference> {
 public:
-  Reference(const Grammar &grammar, const std::string &name, const char *s,
+  Reference(const Grammar *grammar, const std::string &name, const char *s,
             bool is_macro, const std::vector<std::shared_ptr<Ope>> &args)
       : grammar_(grammar), name_(name), s_(s), is_macro_(is_macro), args_(args),
         rule_(nullptr), iarg_(0) {}
@@ -1489,7 +1489,7 @@ public:
 
   std::shared_ptr<Ope> get_core_operator() const;
 
-  const Grammar &grammar_;
+  const Grammar *grammar_;
   const std::string name_;
   const char *s_;
 
@@ -1654,7 +1654,7 @@ usr(std::function<size_t(const char *s, size_t n, SemanticValues &sv, any &dt)>
   return std::make_shared<User>(fn);
 }
 
-inline std::shared_ptr<Ope> ref(const Grammar &grammar, const std::string &name,
+inline std::shared_ptr<Ope> ref(const Grammar *grammar, const std::string &name,
                                 const char *s, bool is_macro,
                                 const std::vector<std::shared_ptr<Ope>> &args) {
   return std::make_shared<Reference>(grammar, name, s, is_macro, args);
@@ -2006,7 +2006,7 @@ private:
 struct ReferenceChecker : public Ope::Visitor {
   using Ope::Visitor::visit;
 
-  ReferenceChecker(const Grammar &grammar,
+  ReferenceChecker(const std::vector<Grammar *> *grammar,
                    const std::vector<std::string> &params)
       : grammar_(grammar), params_(params) {}
 
@@ -2037,7 +2037,7 @@ struct ReferenceChecker : public Ope::Visitor {
   std::unordered_map<std::string, std::string> error_message;
 
 private:
-  const Grammar &grammar_;
+  const std::vector<Grammar *> *grammar_;
   const std::vector<std::string> &params_;
 };
 
@@ -2640,7 +2640,9 @@ inline size_t PrecedenceClimbing::parse_expression(const char *s, size_t n,
   auto action = rule.action;
 
   rule.action = [&](SemanticValues &sv2, any &dt2) -> any {
-    tok = sv2.token();
+    auto &t0 = sv2.tokens[0];
+    tok = std::string(t0.first, t0.second);
+    // tok = sv2.tok;
     if (action) {
       return action(sv2, dt2);
     } else if (!sv2.empty()) {
@@ -2812,11 +2814,22 @@ inline void ReferenceChecker::visit(Reference &ope) {
   auto it = std::find(params_.begin(), params_.end(), ope.name_);
   if (it != params_.end()) { return; }
 
-  if (!grammar_.count(ope.name_)) {
+  if (!(*ope.grammar_).count(ope.name_)) {
+
+    if (grammar_)
+      for (auto gg : *grammar_) {
+        if (gg->count(ope.name_)) {
+          const auto &rule = gg->at(ope.name_);
+          if (!rule.is_macro) {
+            ope.grammar_ = gg;
+            return;
+          }
+        }
+      }
     error_s[ope.name_] = ope.s_;
     error_message[ope.name_] = "'" + ope.name_ + "' is not defined.";
   } else {
-    const auto &rule = grammar_.at(ope.name_);
+    const auto &rule = ope.grammar_->at(ope.name_);
     if (rule.is_macro) {
       if (!ope.is_macro_ || ope.args_.size() != rule.params.size()) {
         error_s[ope.name_] = ope.s_;
@@ -2874,14 +2887,16 @@ class ParserGenerator {
 public:
   static std::shared_ptr<Grammar> parse(const char *s, size_t n,
                                         const Rules &rules, std::string &start,
-                                        Log log) {
-    return get_instance().perform_core(s, n, rules, start, log);
+                                        Log log,
+                                        std::vector<Grammar *> *old = nullptr) {
+    return get_instance().perform_core(s, n, rules, start, log, old);
   }
 
   static std::shared_ptr<Grammar> parse(const char *s, size_t n,
-                                        std::string &start, Log log) {
+                                        std::string &start, Log log,
+                                        std::vector<Grammar *> *old = nullptr) {
     Rules dummy;
-    return parse(s, n, dummy, start, log);
+    return parse(s, n, dummy, start, log, old);
   }
 
   // For debuging purpose
@@ -2905,6 +2920,7 @@ private:
 
   struct Data {
     std::shared_ptr<Grammar> grammar;
+    std::vector<Grammar *> *oldGrammar = nullptr;
     std::string start;
     const char *start_pos = nullptr;
     std::vector<std::pair<std::string, const char *>> duplicates;
@@ -3219,7 +3235,7 @@ private:
         }
 
         std::shared_ptr<Ope> ope =
-            ref(*data.grammar, ident, sv.c_str(), is_macro, args);
+            ref(data.grammar.get(), ident, sv.c_str(), is_macro, args);
 
         if (ignore) {
           return ign(ope);
@@ -3244,9 +3260,7 @@ private:
           cs[name] = std::string(a_s, a_n);
         });
       }
-      default: {
-        return any_cast<std::shared_ptr<Ope>>(sv[0]);
-      }
+      default: { return any_cast<std::shared_ptr<Ope>>(sv[0]); }
       }
     };
 
@@ -3386,10 +3400,11 @@ private:
     return true;
   }
 
-  std::shared_ptr<Grammar> perform_core(const char *s, size_t n,
-                                        const Rules &rules, std::string &start,
-                                        Log log) {
+  std::shared_ptr<Grammar>
+  perform_core(const char *s, size_t n, const Rules &rules, std::string &start,
+               Log log, std::vector<Grammar *> *oldGrammarToInherit) {
     Data data;
+    data.oldGrammar = oldGrammarToInherit;
     any dt = &data;
     auto r = g["Grammar"].parse(s, n, dt);
 
@@ -3455,7 +3470,7 @@ private:
     for (auto &x : grammar) {
       auto &rule = x.second;
 
-      ReferenceChecker vis(*data.grammar, rule.params);
+      ReferenceChecker vis(data.oldGrammar, rule.params);
       rule.accept(vis);
       for (const auto &y : vis.error_s) {
         const auto &name = y.first;
@@ -3565,24 +3580,14 @@ template <typename Annotation> struct AstBase : public Annotation {
   AstBase(const char *a_path, size_t a_line, size_t a_column,
           const char *a_name,
           const std::vector<std::shared_ptr<AstBase>> &a_nodes,
-          size_t a_position = 0, size_t a_length = 0, size_t a_choice_count = 0,
-          size_t a_choice = 0)
-      : path(a_path ? a_path : ""), line(a_line), column(a_column),
-        name(a_name), position(a_position), length(a_length),
-        choice_count(a_choice_count), choice(a_choice), original_name(a_name),
-        original_choice_count(a_choice_count), original_choice(a_choice),
-        tag(str2tag(a_name)), original_tag(tag), is_token(false),
-        nodes(a_nodes) {}
-
-  AstBase(const char *a_path, size_t a_line, size_t a_column,
-          const char *a_name, const std::string &a_token, size_t a_position = 0,
+          const std::string &a_token, size_t a_position = 0,
           size_t a_length = 0, size_t a_choice_count = 0, size_t a_choice = 0)
       : path(a_path ? a_path : ""), line(a_line), column(a_column),
         name(a_name), position(a_position), length(a_length),
         choice_count(a_choice_count), choice(a_choice), original_name(a_name),
         original_choice_count(a_choice_count), original_choice(a_choice),
-        tag(str2tag(a_name)), original_tag(tag), is_token(true),
-        token(a_token) {}
+        tag(str2tag(a_name)), original_tag(tag), token(a_token),
+        nodes(a_nodes) {}
 
   AstBase(const AstBase &ast, const char *a_original_name,
           size_t a_position = 0, size_t a_length = 0,
@@ -3592,8 +3597,8 @@ template <typename Annotation> struct AstBase : public Annotation {
         choice(ast.choice), original_name(a_original_name),
         original_choice_count(a_original_choice_count),
         original_choice(a_original_choise), tag(ast.tag),
-        original_tag(str2tag(a_original_name)), is_token(ast.is_token),
-        token(ast.token), nodes(ast.nodes), parent(ast.parent) {}
+        original_tag(str2tag(a_original_name)) token(ast.token),
+        nodes(ast.nodes), parent(ast.parent) {}
 
   const std::string path;
   const size_t line = 1;
@@ -3610,7 +3615,6 @@ template <typename Annotation> struct AstBase : public Annotation {
   const unsigned int tag;
   const unsigned int original_tag;
 
-  const bool is_token;
   const std::string token;
 
   std::vector<std::shared_ptr<AstBase<Annotation>>> nodes;
@@ -3689,17 +3693,22 @@ template <typename T = Ast> void add_ast_action(Definition &rule) {
   rule.action = [&](const SemanticValues &sv) {
     auto line = sv.line_info();
 
-    if (rule.is_token()) {
+    /*if (rule.is_token()) {
       return std::make_shared<T>(sv.path, line.first, line.second,
                                  rule.name.c_str(), sv.token(),
                                  std::distance(sv.ss, sv.c_str()), sv.length(),
                                  sv.choice_count(), sv.choice());
+    }*/
+    std::string token;
+    if (sv.tokens.size()) {
+      token = std::string(sv.tokens[0].first, sv.tokens[0].second);
     }
 
-    auto ast = std::make_shared<T>(
-        sv.path, line.first, line.second, rule.name.c_str(),
-        sv.transform<std::shared_ptr<T>>(), std::distance(sv.ss, sv.c_str()),
-        sv.length(), sv.choice_count(), sv.choice());
+    auto ast =
+        std::make_shared<T>(sv.path, line.first, line.second, rule.name.c_str(),
+                            sv.transform<std::shared_ptr<T>>(), token,
+                            std::distance(sv.ss, sv.c_str()), sv.length(),
+                            sv.choice_count(), sv.choice());
 
     for (auto node : ast->nodes) {
       node->parent = ast;
@@ -3842,25 +3851,33 @@ template <typename T = Ast> void add_ast_action(Definition &rule) {
 /*-----------------------------------------------------------------------------
  *  parser
  *---------------------------------------------------------------------------*/
-
 class parser {
 public:
   parser() = default;
 
-  parser(const char *s, size_t n, const Rules &rules) {
-    load_grammar(s, n, rules);
+  parser(const char *s, size_t n, const Rules &rules, Log log = nullptr,
+         std::vector<Grammar *> *oldGrammar = nullptr)
+      : log(log) {
+    load_grammar(s, n, rules, oldGrammar);
   }
 
-  parser(const char *s, const Rules &rules) : parser(s, strlen(s), rules) {}
+  parser(const char *s, const Rules &rules, Log log = nullptr,
+         std::vector<Grammar *> *oldGrammar = nullptr)
+      : parser(s, strlen(s), rules, log, oldGrammar) {}
 
-  parser(const char *s, size_t n) : parser(s, n, Rules()) {}
+  parser(const char *s, size_t n, Log log = nullptr,
+         std::vector<Grammar *> *oldGrammar = nullptr)
+      : parser(s, n, Rules(), log, oldGrammar) {}
 
-  parser(const char *s) : parser(s, strlen(s), Rules()) {}
+  parser(const char *s, Log log = nullptr,
+         std::vector<Grammar *> *oldGrammar = nullptr)
+      : parser(s, strlen(s), Rules(), log, oldGrammar) {}
 
   operator bool() { return grammar_ != nullptr; }
 
-  bool load_grammar(const char *s, size_t n, const Rules &rules) {
-    grammar_ = ParserGenerator::parse(s, n, rules, start_, log);
+  bool load_grammar(const char *s, size_t n, const Rules &rules,
+                    std::vector<Grammar *> *oldGrammar = nullptr) {
+    grammar_ = ParserGenerator::parse(s, n, rules, start_, log, oldGrammar);
     return grammar_ != nullptr;
   }
 
@@ -4005,7 +4022,6 @@ private:
   std::shared_ptr<Grammar> grammar_;
   std::string start_;
 };
-
 } // namespace peg
 
 #endif
