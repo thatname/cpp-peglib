@@ -2535,10 +2535,16 @@ inline size_t Holder::parse_core(const char *s, size_t n, SemanticValues &sv,
       sv.tags.emplace_back(str2tag(outer_->name.c_str()));
     }
   } else {
-    if (outer_->error_message) {
-      if (c.message_pos < s) {
-        c.message_pos = s;
+    if (c.message_pos < s) {
+      c.message_pos = s;
+      if (outer_->error_message) {
         c.message = outer_->error_message();
+      } else {
+        c.message = "expected: " + outer_->name + "\n";
+		for (int n = c.rule_stack.size() - 1; n >= 0;--n)
+		{
+          c.message += " when parsing : " + c.rule_stack[n]->name + "\n";
+		}
       }
     }
   }
@@ -2640,8 +2646,7 @@ inline size_t PrecedenceClimbing::parse_expression(const char *s, size_t n,
   auto action = rule.action;
 
   rule.action = [&](SemanticValues &sv2, any &dt2) -> any {
-    auto &t0 = sv2.tokens[0];
-    tok = std::string(t0.first, t0.second);
+    tok = sv2.token();
     // tok = sv2.tok;
     if (action) {
       return action(sv2, dt2);
@@ -2963,7 +2968,8 @@ private:
 
     g["IdentRest"] <= cho(g["IdentStart"], cls("0-9"));
 
-    g["Dictionary"] <= seq(g["LiteralD"], oom(seq(g["PIPE"], g["LiteralD"])));
+    g["Dictionary"] <=
+        cho(g["PIPE"], seq(g["LiteralD"], oom(seq(g["PIPE"], g["LiteralD"]))));
 
     auto lit_ope = cho(seq(cls("'"), tok(zom(seq(npd(cls("'")), g["Char"]))),
                            cls("'"), g["Spacing"]),
@@ -3700,9 +3706,7 @@ template <typename T = Ast> void add_ast_action(Definition &rule) {
                                  sv.choice_count(), sv.choice());
     }*/
     std::string token;
-    if (sv.tokens.size()) {
-      token = std::string(sv.tokens[0].first, sv.tokens[0].second);
-    }
+    if (sv.tokens.size() || sv.empty()) { token = sv.token(); }
 
     auto ast =
         std::make_shared<T>(sv.path, line.first, line.second, rule.name.c_str(),
@@ -4004,7 +4008,7 @@ public:
 private:
   void output_log(const char *s, size_t n, const Definition::Result &r) const {
     if (log) {
-      if (!r.ret) {
+      if (!r.ret || r.len != n) {
         if (r.message_pos) {
           auto line = line_info(s, r.message_pos);
           log(line.first, line.second, r.message);
@@ -4012,9 +4016,6 @@ private:
           auto line = line_info(s, r.error_pos);
           log(line.first, line.second, "syntax error");
         }
-      } else if (r.len != n) {
-        auto line = line_info(s, s + r.len);
-        log(line.first, line.second, "syntax error");
       }
     }
   }
